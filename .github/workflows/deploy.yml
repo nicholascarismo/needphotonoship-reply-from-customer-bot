@@ -22,18 +22,18 @@ jobs:
           mkdir -p ~/.ssh
           ssh-keyscan -H ${{ secrets.DROPLET_HOST }} >> ~/.ssh/known_hosts
 
-- name: Rsync to VPS
-  env:
-    USER: ${{ secrets.DROPLET_USER }}
-    HOST: ${{ secrets.DROPLET_HOST }}
-    REMOTE_DIR: ${{ secrets.REMOTE_DIR }}
-  run: |
-    rsync -az --delete \
-      --exclude ".git" \
-      --exclude ".github" \
-      --exclude "node_modules" \
-      --exclude ".env" \
-      ./ "$USER@$HOST:$REMOTE_DIR/"
+      - name: Rsync to VPS
+        env:
+          USER: ${{ secrets.DROPLET_USER }}
+          HOST: ${{ secrets.DROPLET_HOST }}
+          REMOTE_DIR: ${{ secrets.REMOTE_DIR }}
+        run: |
+          rsync -az --delete \
+            --exclude ".git" \
+            --exclude ".github" \
+            --exclude "node_modules" \
+            --exclude ".env" \
+            ./ "$USER@$HOST:$REMOTE_DIR/"
 
       - name: Install deps & reload with PM2
         env:
@@ -43,14 +43,13 @@ jobs:
         run: |
           ssh "$USER@$HOST" << 'EOF'
           set -e
-          echo "REMOTE_DIR=${REMOTE_DIR:-<unset>}"
-          # Always change into the app folder using the literal secret:
+          # Always change into the app folder using the literal secret path
           cd '${{ secrets.REMOTE_DIR }}'
 
-          # Load shared env
+          # Load shared env (brings in /home/app/.shared_env)
           source ~/.profile || true
 
-          # Use lockfile if present
+          # Install deps
           if [ -f package-lock.json ]; then
             echo "Lockfile present -> npm ci"
             npm ci
