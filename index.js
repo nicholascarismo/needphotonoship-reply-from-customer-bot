@@ -1,36 +1,15 @@
 import 'dotenv/config';
 import boltPkg from '@slack/bolt';
-import { google as GoogleAPI } from 'googleapis';
+const { App } = boltPkg;
 
-const { App, ExpressReceiver } = boltPkg;
-
-/* =========================
-   Slack HTTP Receiver
-========================= */
-const receiver = new ExpressReceiver({
-  signingSecret: process.env.SLACK_SIGNING_SECRET,
-  endpoints: {
-    events: '/slack/events',
-    commands: '/slack/command',
-    interactive: '/slack/interactive',
-  },
-});
-receiver.app.get('/', (_req, res) => res.status(200).type('text/plain').send('OK'));
-receiver.app.get('/health', (_req, res) => res.status(200).type('text/plain').send('OK'));
-receiver.app.get('/version', (_req, res) =>
-  res.status(200).json({ SHOPIFY_API_VERSION: process.env.SHOPIFY_API_VERSION || '2025-10' })
-);
-
+// Socket Mode Bolt app (no ExpressReceiver)
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
-  receiver,
+  appToken: process.env.SLACK_APP_TOKEN,  // xapp-... (App-Level Token with connections:write)
+  socketMode: true,
+  processBeforeResponse: true
 });
 
-/* 🛟 keepalive ping for needphotonoship-reply-from-customer */
-app.command('/needphotonoship-ping', async ({ ack, respond }) => {
-  await ack();
-  await respond(':white_check_mark: needphotonoship-reply-from-customer is receiving POSTs.');
-});
 
 /* =========================
    Env & Config
@@ -1489,9 +1468,8 @@ const latest = await gmailGetLatestInboundInThread(found.threadId);
    Start
 ========================= */
 (async () => {
-  const port = process.env.PORT || 3000;
-  await app.start(port);
-  console.log(`✅ needphotonoship-reply-from-customer running on port ${port}`);
+await app.start();
+console.log(`✅ needphotonoship-reply-from-customer is running (Socket Mode)`);
   console.log('🔧 Watching channel ID:', WATCH_CHANNEL || '(not set)');
 
   try {
