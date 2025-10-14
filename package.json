@@ -1,0 +1,14 @@
+{
+  "name": "needphotonoship-reply-from-customer",
+  "version": "1.0.0",
+  "type": "module",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@slack/bolt": "^3.17.1",
+    "dotenv": "^16.4.5",
+    "googleapis": "^143.0.0"
+  }
+}
