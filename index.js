@@ -55,7 +55,7 @@ const OAUTH_DISABLED = String(process.env.DISABLE_OAUTH_INIT || '').toLowerCase(
 ========================= */
 const ORDER_REGEX_SINGLE = /(C#\d{4,5})/i;     // single capture
 const ORDER_REGEX_MULTI  = /C#\d{4,5}/gi;      // global find-all
-const MUST_CONTAIN_SINGLE_PHRASE = /\[RESPONSE REQUIRED\]\s+Your\s+Carismo\s+Order/i;
+const MUST_CONTAIN_SINGLE_PHRASE = /\[Carismo Design\]\s+Reminder\s*-\s*We\s+need\s+some\s+info\s+from\s+you!/i;
 
 function isDailyReminderString(s) {
   const normalized = (s || '').replace(/[\u2010\u2011\u2012\u2013\u2014\u2212]/g, '-'); // normalize hyphens
@@ -417,11 +417,11 @@ function extractSubjectFromSlackEmail(event) {
 
 function looksLikeReminderEmail(event) {
   const subj = (extractSubjectFromSlackEmail(event) || '').toLowerCase();
-  if (subj.includes('[carismo design] reminder - we need some info from you')) return true;
+  if (subj.includes('[carismo design] reminder - we need some info from you!')) return true;
 
   // belt-and-suspenders: also scan the haystack text
   const txt = collectEmailHaystacks(event).toLowerCase();
-  return /\breminder\s*-\s*we\s+need\s+some\s+info\s+from\s+you\b/.test(txt);
+  return /\[carismo design\]\s*reminder\s*-\s*we\s+need\s+some\s+info\s+from\s+you!/i.test(txt);
 }
 
 function collectEmailHaystacks(event) {
