@@ -619,11 +619,18 @@ async function gmailFindThread({ subjectGuess, orderName }) {
   const baseFilters = `to:${our} -from:${our} newer_than:30d`;
   const queries = [];
 
-  if (normSubject && orderName) {
-    queries.push(`${baseFilters} subject:"${normSubject.replace(/"/g, '\\"')}" "${orderName}"`);
+    const normSubjectEsc = normSubject.replace(/"/g, '\\"');
+
+  // Query 1: subject (exact phrase you saw in Slack)
+  if (normSubjectEsc) {
+    queries.push(`${baseFilters} subject:"${normSubjectEsc}"`);
   }
-  if (orderName) queries.push(`${baseFilters} "${orderName}"`);
-  if (normSubject) queries.push(`${baseFilters} subject:"${normSubject.replace(/"/g, '\\"')}"`);
+
+  // Query 2 (fallback): if we somehow didn't get a subject, still require the app's anchor phrase
+  if (!normSubjectEsc) {
+    // This keeps the search safely in NeedPhotoNoShip territory
+    queries.push(`${baseFilters} subject:"we need some info from you"`);
+  }
 
   // Helper to check if a thread has a legit inbound-to-us message
   function threadHasInboundToUs(thread) {
@@ -640,7 +647,6 @@ async function gmailFindThread({ subjectGuess, orderName }) {
 
       const anchorOk = MUST_CONTAIN_SINGLE_PHRASE.test(subj);
       if (!fromIsUs && toIncludesUs && anchorOk) return true;   // ideal case (your “[RESPONSE REQUIRED] …”)
-      if (!fromIsUs && toIncludesUs) return true;               // otherwise still customer → us
     }
     return false;
   }
@@ -775,16 +781,36 @@ async function gmailGetLatestInboundInThread(threadId) {
   const messages = await gmailGetThreadFull(threadId);
   const our = SHOP_FROM_EMAIL.toLowerCase();
 
-  // Primary: last message NOT from us
+  // Prefer the latest inbound-to-us whose subject matches this app's anchor phrase
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
     const headers = Object.fromEntries((m.payload?.headers || []).map(h => [h.name.toLowerCase(), h.value]));
     const from = (headers['from'] || '').toLowerCase();
-    const fromIsUs = from.includes(`<${our}>`) || from.includes(our) || from.startsWith(our);
-    if (!fromIsUs) return extractRichMessage(m);
+    const subj = headers['subject'] || '';
+    const fromIsUs =
+      from.includes(`<${our}>`) || from.includes(our) || from.startsWith(our);
+
+    if (!fromIsUs && MUST_CONTAIN_SINGLE_PHRASE.test(subj)) {
+      return extractRichMessage(m);
+    }
   }
-  // Fallback: last message
-  return extractRichMessage(messages[messages.length - 1]);
+
+  // Next best: any latest inbound (still not from us) — but only if it matches the anchor
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    const headers = Object.fromEntries((m.payload?.headers || []).map(h => [h.name.toLowerCase(), h.value]));
+    const from = (headers['from'] || '').toLowerCase();
+    const subj = headers['subject'] || '';
+    const fromIsUs =
+      from.includes(`<${our}>`) || from.includes(our) || from.startsWith(our);
+
+    if (!fromIsUs && MUST_CONTAIN_SINGLE_PHRASE.test(subj)) {
+      return extractRichMessage(m);
+    }
+  }
+
+  // If nothing matches the anchor, throw — forces us to fail closed instead of replying on a wrong thread
+  throw new Error('No inbound message in this thread matches the required subject anchor for this app.');
 }
 
 /** utils for HTML replies/forwards */
