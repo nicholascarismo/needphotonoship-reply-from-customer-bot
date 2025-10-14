@@ -24,33 +24,44 @@ jobs:
 
       - name: Rsync to VPS
         env:
-          HOST: ${{ secrets.DROPLET_HOST }}
           USER: ${{ secrets.DROPLET_USER }}
+          HOST: ${{ secrets.DROPLET_HOST }}
           REMOTE_DIR: ${{ secrets.REMOTE_DIR }}
         run: |
           rsync -az --delete --delete-excluded \
             --exclude ".git" \
             --exclude ".github" \
-            --exclude "workflow archive" \
-            --exclude "node_modules/" \
-            ./ $USER@$HOST:$REMOTE_DIR/
+            --exclude "node_modules" \
+            ./ "$USER@$HOST:$REMOTE_DIR/"
 
       - name: Install deps & reload with PM2
         env:
-          HOST: ${{ secrets.DROPLET_HOST }}
           USER: ${{ secrets.DROPLET_USER }}
+          HOST: ${{ secrets.DROPLET_HOST }}
           REMOTE_DIR: ${{ secrets.REMOTE_DIR }}
         run: |
-          ssh $USER@$HOST << 'EOF'
+          ssh "$USER@$HOST" << 'EOF'
           set -e
-          cd $REMOTE_DIR
-          source ~/.profile
+          echo "REMOTE_DIR=${REMOTE_DIR:-<unset>}"
+          # Always change into the app folder using the literal secret:
+          cd '${{ secrets.REMOTE_DIR }}'
+
+          # Load shared env
+          source ~/.profile || true
+
+          # Use lockfile if present
           if [ -f package-lock.json ]; then
+            echo "Lockfile present -> npm ci"
             npm ci
           else
+            echo "No lockfile -> npm install"
             npm install
           fi
-          pm2 describe $(basename $REMOTE_DIR) >/dev/null 2>&1 || pm2 start index.js --name $(basename $REMOTE_DIR)
-          pm2 reload $(basename $REMOTE_DIR)
+
+          # Start if first time, else reload
+          APP_NAME="$(basename '${{ secrets.REMOTE_DIR }}')"
+          pm2 describe "$APP_NAME" >/dev/null 2>&1 || pm2 start index.js --name "$APP_NAME"
+
+          pm2 reload "$APP_NAME"
           pm2 save
           EOF
