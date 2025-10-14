@@ -22,17 +22,18 @@ jobs:
           mkdir -p ~/.ssh
           ssh-keyscan -H ${{ secrets.DROPLET_HOST }} >> ~/.ssh/known_hosts
 
-      - name: Rsync to VPS
-        env:
-          USER: ${{ secrets.DROPLET_USER }}
-          HOST: ${{ secrets.DROPLET_HOST }}
-          REMOTE_DIR: ${{ secrets.REMOTE_DIR }}
-        run: |
-          rsync -az --delete --delete-excluded \
-            --exclude ".git" \
-            --exclude ".github" \
-            --exclude "node_modules" \
-            ./ "$USER@$HOST:$REMOTE_DIR/"
+- name: Rsync to VPS
+  env:
+    USER: ${{ secrets.DROPLET_USER }}
+    HOST: ${{ secrets.DROPLET_HOST }}
+    REMOTE_DIR: ${{ secrets.REMOTE_DIR }}
+  run: |
+    rsync -az --delete \
+      --exclude ".git" \
+      --exclude ".github" \
+      --exclude "node_modules" \
+      --exclude ".env" \
+      ./ "$USER@$HOST:$REMOTE_DIR/"
 
       - name: Install deps & reload with PM2
         env:
