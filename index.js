@@ -18,7 +18,7 @@ const gmail = google.gmail({ version: 'v1', auth: oauth2 });
 // Socket Mode Bolt app (no ExpressReceiver)
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
-  appToken: process.env.SLACK_APP_TOKEN,  // xapp-... (App-Level Token with connections:write)
+  appToken: process.env.SLACK_APP_TOKEN, // xapp-... (App-Level Token with connections:write)
   socketMode: true,
   processBeforeResponse: true
 });
