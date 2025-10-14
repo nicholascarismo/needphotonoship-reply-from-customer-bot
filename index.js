@@ -2,6 +2,19 @@ import 'dotenv/config';
 import boltPkg from '@slack/bolt';
 const { App } = boltPkg;
 
+import { google } from 'googleapis';
+
+// --- Gmail client (using your existing OAuth creds / refresh token) ---
+const oauth2 = new google.auth.OAuth2(
+  process.env.GMAIL_CLIENT_ID,
+  process.env.GMAIL_CLIENT_SECRET,
+  process.env.GMAIL_REDIRECT_URI // not used at runtime when you already have a refresh token, but fine to keep
+);
+oauth2.setCredentials({ refresh_token: process.env.GMAIL_REFRESH_TOKEN });
+
+// Reuse this client everywhere
+const gmail = google.gmail({ version: 'v1', auth: oauth2 });
+
 // Socket Mode Bolt app (no ExpressReceiver)
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
@@ -549,14 +562,14 @@ function mkOAuthClient() {
   if (!GMAIL_CLIENT_ID || !GMAIL_CLIENT_SECRET || !GMAIL_REDIRECT_URI) {
     throw new Error('Missing Gmail OAuth env: GMAIL_CLIENT_ID/SECRET/REDIRECT_URI');
   }
-  return new GoogleAPI.auth.OAuth2(GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REDIRECT_URI);
+  return new google.auth.OAuth2(GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REDIRECT_URI);
 }
 
 async function getGmail() {
   if (!GMAIL_REFRESH_TOKEN) throw new Error('GMAIL_REFRESH_TOKEN not set');
   const auth = mkOAuthClient();
   auth.setCredentials({ refresh_token: GMAIL_REFRESH_TOKEN });
-  return GoogleAPI.gmail({ version: 'v1', auth });
+  return google.gmail({ version: 'v1', auth });
 }
 
 function parseEmailAddress(headerVal) {
