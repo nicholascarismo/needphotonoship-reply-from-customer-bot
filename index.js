@@ -18,9 +18,10 @@ const gmail = google.gmail({ version: 'v1', auth: oauth2 });
 // Socket Mode Bolt app (no ExpressReceiver)
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
-  appToken: process.env.SLACK_APP_TOKEN, // xapp-... (App-Level Token with connections:write)
+  appToken: process.env.SLACK_APP_TOKEN, // xapp-... (connections:write)
   socketMode: true,
-  processBeforeResponse: true
+  processBeforeResponse: true,
+  logLevel: 'debug'
 });
 
 
@@ -416,12 +417,17 @@ function extractSubjectFromSlackEmail(event) {
 }
 
 function looksLikeReminderEmail(event) {
-  const subj = (extractSubjectFromSlackEmail(event) || '').toLowerCase();
-  if (subj.includes('we need some info from you')) return true;
+  const subjRaw = extractSubjectFromSlackEmail(event) || '';
+  const subj = subjRaw.toLowerCase();
+  const hasPhrase = subj.includes('we need some info from you');
 
-  // belt-and-suspenders: also scan the haystack text
+  // Also scan the haystack text as a fallback (unchanged logic)
   const txt = collectEmailHaystacks(event);
-  return /\bwe\s+need\s+some\s+info\s+from\s+you\b/i.test(txt);
+  const bodyMatch = /\bwe\s+need\s+some\s+info\s+from\s+you\b/i.test(txt);
+
+  console.log('[trigger-check] subjRaw="%s" | subjHasPhrase=%s | bodyHasPhrase=%s', subjRaw, hasPhrase, bodyMatch);
+
+  return hasPhrase || bodyMatch;
 }
 
 function collectEmailHaystacks(event) {
@@ -1018,6 +1024,9 @@ async function postActionCard({ client, channel, thread_ts, orderName, preview, 
 ========================= */
 app.event('message', async ({ event, client, logger }) => {
   try {
+console.log('[event] ts=%s channel=%s subtype=%s thread_ts=%s', event.ts, event.channel, event.subtype, event.thread_ts || '');
+console.log('[event] extractedSubject="%s"', extractSubjectFromSlackEmail(event));
+console.log('[event] WATCH_CHANNEL=%s (from env)', WATCH_CHANNEL || '(unset)');
     // Channel guard
     if (!WATCH_CHANNEL) return;
     if (event.channel !== WATCH_CHANNEL) return;
