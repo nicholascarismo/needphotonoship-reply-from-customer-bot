@@ -1,29 +1,18 @@
 import 'dotenv/config';
 import boltPkg from '@slack/bolt';
+import { google as GoogleAPI } from 'googleapis';
+
 const { App } = boltPkg;
 
-import { google } from 'googleapis';
-
-// --- Gmail client (using your existing OAuth creds / refresh token) ---
-const oauth2 = new google.auth.OAuth2(
-  process.env.GMAIL_CLIENT_ID,
-  process.env.GMAIL_CLIENT_SECRET,
-  process.env.GMAIL_REDIRECT_URI // not used at runtime when you already have a refresh token, but fine to keep
-);
-oauth2.setCredentials({ refresh_token: process.env.GMAIL_REFRESH_TOKEN });
-
-// Reuse this client everywhere
-const gmail = google.gmail({ version: 'v1', auth: oauth2 });
-
-// Socket Mode Bolt app (no ExpressReceiver)
+/* =========================
+   Slack Socket Mode App
+========================= */
 const app = new App({
-  token: process.env.SLACK_BOT_TOKEN,
-  appToken: process.env.SLACK_APP_TOKEN, // xapp-... (connections:write)
+  token: process.env.SLACK_BOT_TOKEN,   // xoxb-...
+  appToken: process.env.SLACK_APP_TOKEN, // xapp-... (App-Level Token with connections:write)
   socketMode: true,
-  processBeforeResponse: true,
-  logLevel: 'debug'
+  processBeforeResponse: true
 });
-
 
 /* =========================
    Env & Config
@@ -31,8 +20,8 @@ const app = new App({
 const WATCH_CHANNEL =
   process.env.FORWARD_CHANNEL_ID || process.env.ORDER_EMAIL_CHANNEL_ID || '';
 
-const SHOPIFY_DOMAIN = process.env.SHOPIFY_DOMAIN;          // e.g. carismodesign.myshopify.com
-const SHOPIFY_TOKEN  = process.env.SHOPIFY_ADMIN_TOKEN;
+const SHOPIFY_DOMAIN  = process.env.SHOPIFY_DOMAIN;
+const SHOPIFY_TOKEN   = process.env.SHOPIFY_ADMIN_TOKEN;
 const SHOPIFY_VERSION = process.env.SHOPIFY_API_VERSION || '2025-10';
 
 const TRELLO_KEY   = process.env.TRELLO_KEY;
@@ -43,12 +32,14 @@ const TRELLO_BOARD_NAME   = process.env.TRELLO_BOARD_NAME || 'Carismo Design';
 const TRELLO_LIST_NAME    = process.env.TRELLO_LIST_NAME  || 'Nick To-Do';
 
 /* Gmail config */
-const SHOP_FROM_EMAIL = (process.env.SHOP_FROM_EMAIL || 'shop@carismodesign.com').toLowerCase();
-const GMAIL_CLIENT_ID = process.env.GMAIL_CLIENT_ID;
+const SHOP_FROM_EMAIL     = (process.env.SHOP_FROM_EMAIL || 'shop@carismodesign.com').toLowerCase();
+const GMAIL_CLIENT_ID     = process.env.GMAIL_CLIENT_ID;
 const GMAIL_CLIENT_SECRET = process.env.GMAIL_CLIENT_SECRET;
-const GMAIL_REDIRECT_URI = process.env.GMAIL_REDIRECT_URI;
+const GMAIL_REDIRECT_URI  = process.env.GMAIL_REDIRECT_URI;
 const GMAIL_REFRESH_TOKEN = process.env.GMAIL_REFRESH_TOKEN;
-const OAUTH_DISABLED = String(process.env.DISABLE_OAUTH_INIT || '').toLowerCase() === 'true';
+
+/* Disable OAuth HTTP init/callback on the VPS */
+const OAUTH_DISABLED = true;
 
 
 /* =========================
@@ -56,6 +47,8 @@ const OAUTH_DISABLED = String(process.env.DISABLE_OAUTH_INIT || '').toLowerCase(
 ========================= */
 const ORDER_REGEX_SINGLE = /(C#\d{4,5})/i;     // single capture
 const ORDER_REGEX_MULTI  = /C#\d{4,5}/gi;      // global find-all
+// This app is for replies to the reminder email that has no order #
+// e.g., “[Carismo Design] Reminder - We need some info from you!”
 const MUST_CONTAIN_SINGLE_PHRASE = /\bwe\s+need\s+some\s+info\s+from\s+you\b/i;
 
 function isDailyReminderString(s) {
@@ -171,7 +164,7 @@ async function getOrderByName(orderName) {
 // Find the order for this customer email that has the tag NeedPhotoNoShip
 async function getOrderByCustomerEmailWithTag(email, tag) {
   if (!email) return null;
-  // Shopify order search supports: email: and tag:
+  // Shopify Admin search supports email: and tag:
   const q = `email:${email} tag:${tag} status:any`;
   const data = await shopifyGQL(ORDER_LOOKUP_GQL, { q });
   return data?.orders?.edges?.[0]?.node ?? null;
@@ -282,154 +275,6 @@ async function resolveTrelloIds() {
 /* =========================
    Slack Email helpers
 ========================= */
-
-/** Prefer customer address from the Slack Email header card (attachments[].fields) */
-const OUR_DOMAIN = (SHOP_FROM_EMAIL.split('@')[1] || '').toLowerCase();
-function isOurAddress(addr) {
-  const a = String(addr || '').toLowerCase().trim();
-  if (!a) return false;
-  if (a === SHOP_FROM_EMAIL) return true;
-  if (OUR_DOMAIN && a.endsWith(`@${OUR_DOMAIN}`)) return true;
-  return false;
-}
-
-function extractCustomerEmailFromAttachmentFields(event) {
-  if (!Array.isArray(event.attachments)) return '';
-
-  const fromEmails = [];
-  const otherEmails = [];
-
-  for (const a of event.attachments) {
-    const fields = Array.isArray(a.fields) ? a.fields : [];
-    for (const f of fields) {
-      const rawTitle = String(f?.title || '').toLowerCase().trim();
-      const title = rawTitle.replace(/:$/, ''); // normalize "From:" -> "from"
-      const val   = String(f?.value || '');
-
-      // Case A: From John <john@ex.com>
-      const angle = val.match(/<([^>]+)>/);
-      if (angle?.[1]) {
-        const e = angle[1].trim().toLowerCase();
-        if (!isOurAddress(e)) (title === 'from' ? fromEmails : otherEmails).push(e);
-        continue;
-      }
-
-      // Case B: raw addresses in the value
-      const raws = val.match(/[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/g) || [];
-      for (const r of raws) {
-        const e = r.trim().toLowerCase();
-        if (!isOurAddress(e)) (title === 'from' ? fromEmails : otherEmails).push(e);
-      }
-    }
-  }
-
-  // Choose best: From > any other
-  return fromEmails[0] || otherEmails[0] || '';
-}
-
-function extractCustomerEmailFromFilesMeta(event) {
-  if (!Array.isArray(event.files)) return '';
-
-  for (const f of event.files) {
-    // Slack Email posts the message as a file with mode: "email"
-    if (f && f.mode === 'email') {
-      // Prefer explicit Reply-To if Slack provides it (rare but supported)
-      const replyTo = (f.headers && f.headers.reply_to) ? String(f.headers.reply_to).trim().toLowerCase() : '';
-      if (replyTo && !isOurAddress(replyTo)) return replyTo;
-
-      // Otherwise use the structured From[] list
-      const fromList = Array.isArray(f.from) ? f.from : [];
-      for (const fr of fromList) {
-        const addr = String(fr?.address || '').trim().toLowerCase();
-        if (addr && !isOurAddress(addr)) return addr;
-      }
-    }
-  }
-  return '';
-}
-
-/** Fallbacks: look in forwarded text/HTML if needed */
-function extractCustomerEmailFromForwardedText(text) {
-  if (!text) return '';
-  const t = String(text);
-
-  // 1) Plain header: From: Name <email@domain>
-  let m = t.match(/^\s*From:\s*.*?<([^>]+)>\s*$/im);
-  if (m?.[1] && !isOurAddress(m[1])) return m[1].trim().toLowerCase();
-
-  // 2) HTML-escaped: From: … &lt;email@domain&gt;
-  m = t.match(/From:\s*[^<]*&lt;([^&>]+)&gt;/i);
-  if (m?.[1] && !isOurAddress(m[1])) return m[1].trim().toLowerCase();
-
-  // 3) Reply-To
-  m = t.match(/^\s*Reply-To:\s*.*?<([^>]+)>\s*$/im);
-  if (m?.[1] && !isOurAddress(m[1])) return m[1].trim().toLowerCase();
-  m = t.match(/Reply-To:\s*[^<]*&lt;([^&>]+)&gt;/i);
-  if (m?.[1] && !isOurAddress(m[1])) return m[1].trim().toLowerCase();
-
-  // 4) mailto:
-  const mailtos = Array.from(t.matchAll(/mailto:([^\s"'?>]+)/ig)).map(x => (x[1] || '').trim().toLowerCase());
-  const mailtoPick = (mailtos || []).find(e => e && !isOurAddress(e));
-  if (mailtoPick) return mailtoPick;
-
-  // 5) generic raw email pattern
-  const rawEmails = Array.from(t.matchAll(/[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/g)).map(x => x[0].toLowerCase());
-  const rawPick = (rawEmails || []).find(e => e && !isOurAddress(e));
-  if (rawPick) return rawPick;
-
-  return '';
-}
-
-async function extractCustomerEmailFromEvent(event, logger) {
-  // 1) Slack Email header card (grey box)
-  const fromHeader = extractCustomerEmailFromAttachmentFields(event);
-  if (fromHeader) return fromHeader;
-
-  // 1a) 🔥 Slack Email file metadata (most reliable in your workspace)
-  const fromFileMeta = extractCustomerEmailFromFilesMeta(event);
-  if (fromFileMeta) return fromFileMeta;
-
-  // 2) Visible text/attachments/blocks
-  const hay = collectEmailHaystacks(event);
-  let email = extractCustomerEmailFromForwardedText(hay);
-  if (email) return email;
-
-  // 3) Download file bodies (HTML/text) as last resort
-  const files = await slurpSlackFilesText(event, logger);
-  for (const t of files) {
-    email = extractCustomerEmailFromForwardedText(t);
-    if (email) return email;
-  }
-
-  return '';
-}
-
-/** Subject/Body detector for this bot’s ONLY email type */
-function extractSubjectFromSlackEmail(event) {
-  const titles = (event.attachments || []).map(a => a.title).filter(Boolean);
-  if (titles.length) return titles[0].trim();
-  if (event.text) {
-    const first = String(event.text).split('\n')[0].trim();
-    if (/^subject:/i.test(first)) return first.replace(/^[Ss]ubject:\s*/, '').trim();
-    return first;
-  }
-  return '';
-}
-
-function looksLikeReminderEmail(event) {
-  const subjRaw = extractSubjectFromSlackEmail(event) || '';
-  const subj = subjRaw.toLowerCase();
-  const hasPhrase = subj.includes('we need some info from you');
-
-  // Also scan the haystack text as a fallback (unchanged logic)
-  const txt = collectEmailHaystacks(event);
-  const bodyMatch = /\bwe\s+need\s+some\s+info\s+from\s+you\b/i.test(txt);
-
-  console.log('[trigger-check] subjRaw="%s" | subjHasPhrase=%s | bodyHasPhrase=%s', subjRaw, hasPhrase, bodyMatch);
-
-  return hasPhrase || bodyMatch;
-}
-
 function collectEmailHaystacks(event) {
   const haystacks = [];
   if (event.text) haystacks.push(event.text);
@@ -465,6 +310,37 @@ function collectEmailHaystacks(event) {
   return haystacks.join('\n');
 }
 
+function looksLikeReminderEmail(event) {
+  const subjRaw = extractSubjectFromSlackEmail(event) || '';
+  const subj = subjRaw.toLowerCase();
+  const subjHasPhrase = subj.includes('we need some info from you');
+
+  const hay = collectEmailHaystacks(event);
+  const bodyHasPhrase = /\bwe\s+need\s+some\s+info\s+from\s+you\b/i.test(hay);
+
+  return subjHasPhrase || bodyHasPhrase;
+}
+
+function extractSubjectFromSlackEmail(event) {
+  // 1) Prefer Slack Email file metadata (most reliable)
+  if (Array.isArray(event.files)) {
+    for (const f of event.files) {
+      if (f && f.mode === 'email') {
+        if (f.subject) return String(f.subject).trim();
+        if (f.headers?.subject) return String(f.headers.subject).trim();
+      }
+    }
+  }
+  // 2) Attachment titles / visible text fallback
+  const titles = (event.attachments || []).map(a => a.title).filter(Boolean);
+  if (titles.length) return titles[0].trim();
+  if (event.text) {
+    const first = String(event.text).split('\n')[0].trim();
+    if (/^subject:/i.test(first)) return first.replace(/^[Ss]ubject:\s*/, '').trim();
+    return first;
+  }
+  return '';
+}
 
 // === Slack Email metadata resolver (subject + customer email) ===
 async function resolveEmailMetaFromSlack({ client, channel, root_ts }) {
@@ -513,7 +389,6 @@ async function resolveEmailMetaFromSlack({ client, channel, root_ts }) {
 
   return { subject, fromAddress };
 }
-
 
 // --- Ignore the Daily NeedPhotoNoShip reminder in THIS app ---
 const DAILY_NEEDPHOTO_SUBJECT = /^Daily Reminder to Remove NeedPhotoNoShip Tag and Follow-Up Metafields as Needed$/i;
@@ -617,14 +492,14 @@ function mkOAuthClient() {
   if (!GMAIL_CLIENT_ID || !GMAIL_CLIENT_SECRET || !GMAIL_REDIRECT_URI) {
     throw new Error('Missing Gmail OAuth env: GMAIL_CLIENT_ID/SECRET/REDIRECT_URI');
   }
-  return new google.auth.OAuth2(GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REDIRECT_URI);
+  return new GoogleAPI.auth.OAuth2(GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REDIRECT_URI);
 }
 
 async function getGmail() {
   if (!GMAIL_REFRESH_TOKEN) throw new Error('GMAIL_REFRESH_TOKEN not set');
   const auth = mkOAuthClient();
   auth.setCredentials({ refresh_token: GMAIL_REFRESH_TOKEN });
-  return google.gmail({ version: 'v1', auth });
+  return GoogleAPI.gmail({ version: 'v1', auth });
 }
 
 function parseEmailAddress(headerVal) {
@@ -688,13 +563,14 @@ async function gmailFindThread({ subjectGuess, orderName }) {
       const toIncludesUs = toList.includes(our);
 
       const anchorOk = MUST_CONTAIN_SINGLE_PHRASE.test(subj);
-      if (!fromIsUs && toIncludesUs && anchorOk) return true;   // ideal case for this app
+      if (!fromIsUs && toIncludesUs && anchorOk) return true;   // ideal case (your “[RESPONSE REQUIRED] …”)
       if (!fromIsUs && toIncludesUs) return true;               // otherwise still customer → us
     }
     return false;
   }
 
   for (const q of queries) {
+    // Search threads, not individual messages
     const tl = await gmail.users.threads.list({ userId: 'me', q, maxResults: 10 });
     const threads = tl.data.threads || [];
     for (const t of threads) {
@@ -704,6 +580,7 @@ async function gmailFindThread({ subjectGuess, orderName }) {
         format: 'full'
       });
       if (threadHasInboundToUs(thr.data)) {
+        // Return thread id; let downstream pick the anchored/latest message
         return { threadId: thr.data.id };
       }
     }
@@ -822,36 +699,16 @@ async function gmailGetLatestInboundInThread(threadId) {
   const messages = await gmailGetThreadFull(threadId);
   const our = SHOP_FROM_EMAIL.toLowerCase();
 
-  // Prefer the latest inbound-to-us whose subject matches this app's anchor phrase
+  // Primary: last message NOT from us
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
     const headers = Object.fromEntries((m.payload?.headers || []).map(h => [h.name.toLowerCase(), h.value]));
     const from = (headers['from'] || '').toLowerCase();
-    const subj = headers['subject'] || '';
-    const fromIsUs =
-      from.includes(`<${our}>`) || from.includes(our) || from.startsWith(our);
-
-    if (!fromIsUs && MUST_CONTAIN_SINGLE_PHRASE.test(subj)) {
-      return extractRichMessage(m);
-    }
+    const fromIsUs = from.includes(`<${our}>`) || from.includes(our) || from.startsWith(our);
+    if (!fromIsUs) return extractRichMessage(m);
   }
-
-  // Next best: any latest inbound (still not from us) — but only if it matches the anchor
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i];
-    const headers = Object.fromEntries((m.payload?.headers || []).map(h => [h.name.toLowerCase(), h.value]));
-    const from = (headers['from'] || '').toLowerCase();
-    const subj = headers['subject'] || '';
-    const fromIsUs =
-      from.includes(`<${our}>`) || from.includes(our) || from.startsWith(our);
-
-    if (!fromIsUs && MUST_CONTAIN_SINGLE_PHRASE.test(subj)) {
-      return extractRichMessage(m);
-    }
-  }
-
-  // If nothing matches the anchor, throw — forces us to fail closed instead of replying on a wrong thread
-  throw new Error('No inbound message in this thread matches the required subject anchor for this app.');
+  // Fallback: last message
+  return extractRichMessage(messages[messages.length - 1]);
 }
 
 /** utils for HTML replies/forwards */
@@ -1091,28 +948,48 @@ async function postActionCard({ client, channel, thread_ts, orderName, preview, 
 ========================= */
 app.event('message', async ({ event, client, logger }) => {
   try {
-console.log('[event] ts=%s channel=%s subtype=%s thread_ts=%s', event.ts, event.channel, event.subtype, event.thread_ts || '');
-console.log('[event] extractedSubject="%s"', extractSubjectFromSlackEmail(event));
-console.log('[event] WATCH_CHANNEL=%s (from env)', WATCH_CHANNEL || '(unset)');
+    logger.info({
+      msg: 'message event (App 2)',
+      ch: event.channel,
+      subtype: event.subtype,
+      bot_id: !!event.bot_id,
+      hasText: !!event.text,
+      hasBlocks: Array.isArray(event.blocks),
+      hasFiles: Array.isArray(event.files),
+      ts: event.ts
+    });
+
     // Channel guard
     if (!WATCH_CHANNEL) return;
     if (event.channel !== WATCH_CHANNEL) return;
 
-    // Only act on file_share posts (how Slack Email forwards arrive)
+    // Only act on Slack Email forward posts
     if (event.subtype && event.subtype !== 'file_share') return;
 
-    // Only handle the “[Carismo Design] Reminder - We need some info from you!” replies
+    // ⛔️ Still ignore the daily NeedPhotoNoShip reminder broadcast
+    if (isDailyNeedPhotoReminder(event)) {
+      logger.info('Skipping daily NeedPhotoNoShip reminder in app2');
+      return;
+    }
+
+    // Only handle the reminder replies (“We need some info from you”)
     if (!looksLikeReminderEmail(event)) return;
 
-    // Subject (for display on the button modal) and preview line
+    // Subject (for display) and preview line
     const subjectGuess = extractSubjectFromSlackEmail(event) || '';
     const preview =
       (event.text && event.text.slice(0, 120)) ||
       (event.files?.[0]?.title?.slice(0, 120)) ||
       '';
 
-    // 1) Identify the customer email (prefer Slack Email header card)
-    const customerEmail = await extractCustomerEmailFromEvent(event, logger);
+    // 1) Resolve customer email straight from the Slack Email file metadata (most reliable)
+    const { subject, fromAddress } = await resolveEmailMetaFromSlack({
+      client,
+      channel: event.channel,
+      root_ts: event.thread_ts || event.ts
+    });
+
+    const customerEmail = (fromAddress || '').trim().toLowerCase();
     if (!customerEmail) {
       await client.chat.postMessage({
         channel: event.channel,
@@ -1122,7 +999,7 @@ console.log('[event] WATCH_CHANNEL=%s (from env)', WATCH_CHANNEL || '(unset)');
       return;
     }
 
-    // 2) Find the correct Shopify order: same customer email + has tag NeedPhotoNoShip
+    // 2) Find Shopify order for that customer with tag NeedPhotoNoShip
     const order = await getOrderByCustomerEmailWithTag(customerEmail, 'NeedPhotoNoShip');
     if (!order?.name) {
       await client.chat.postMessage({
@@ -1133,17 +1010,18 @@ console.log('[event] WATCH_CHANNEL=%s (from env)', WATCH_CHANNEL || '(unset)');
       return;
     }
 
-    // 3) Post the action card with the finalized buttons/behaviors (from oem bot)
+    // 3) Post the same action card as App 1 (buttons behave identically)
     await postActionCard({
       client,
       channel: event.channel,
       thread_ts: event.thread_ts || event.ts,
       orderName: order.name.toUpperCase(),
       preview,
-      subjectGuess
+      subjectGuess: subjectGuess || subject || ''   // prefer Slack subject; fall back to file subject
     });
+
   } catch (e) {
-    logger.error('message handler error', e);
+    logger.error('message handler error (App 2)', e);
   }
 });
 
@@ -1277,8 +1155,7 @@ app.action('reply_forward', async ({ ack, body, client }) => {
   await ack();
 
   const channel = body.channel?.id;
-  const thread_ts = body.message?.thread_ts || body.message?.ts; // root ts where the Email file is attached
-
+  const thread_ts = body.message?.thread_ts || body.message?.ts; // this is the rootts for the email post (where files live)
   let orderName = '';
   let subjectGuess = '';
   try {
@@ -1317,7 +1194,7 @@ app.action('reply_forward', async ({ ack, body, client }) => {
           }
         }
       ],
-      private_metadata: JSON.stringify({ channel, thread_ts, orderName, subjectGuess, customerEmail: customerEmailGuess })
+      private_metadata: JSON.stringify({ channel, thread_ts, orderName, subjectGuess, customerEmail: customerEmailGuess }),
     }
   });
 });
@@ -1332,10 +1209,10 @@ app.view('choose_reply_or_forward', async ({ ack, body, view, client, logger }) 
     return;
   }
 
+  // If replying, resolve the customer email + subject BEFORE showing the body input.
   if (choice === 'reply') {
     const { orderName, subjectGuess } = md;
 
-    // Start with Slack-derived guesses; we will upgrade from Gmail thread if possible
     let resolvedTo = md.customerEmail || '';
     let resolvedSubject = md.subjectGuess || '';
     let latest = null;
@@ -1345,7 +1222,7 @@ app.view('choose_reply_or_forward', async ({ ack, body, view, client, logger }) 
       if (found) {
         const anchored = await gmailPickCustomerFromAnchoredHeader(found.threadId);
         latest = anchored?.rich || await gmailGetLatestInboundInThread(found.threadId);
-
+        // Only upgrade if Slack didn’t already give us values
         if (!resolvedTo) {
           resolvedTo = anchored?.email || latest?.replyAddress || '';
         }
@@ -1358,26 +1235,26 @@ app.view('choose_reply_or_forward', async ({ ack, body, view, client, logger }) 
       logger?.error?.('pre-resolve reply info failed', e);
     }
 
-    // HARD REQUIREMENT: do not proceed unless BOTH are resolved
-    if (!resolvedTo || !resolvedSubject) {
-      await ack({
-        response_action: 'update',
-        view: {
-          type: 'modal',
-          callback_id: 'reply_cannot_resolve',
-          title: { type: 'plain_text', text: 'Reply to Customer' },
-          close: { type: 'plain_text', text: 'Close' },
-          blocks: [
-            { type: 'section', text: { type: 'mrkdwn', text: '*Cannot determine customer email and subject automatically.*' } },
-            { type: 'section', text: { type: 'mrkdwn', text: `*Order:* ${orderName}` } },
-            { type: 'section', text: { type: 'mrkdwn', text: `*Detected subject in Slack:* ${subjectGuess || '(none)'}` } },
-            { type: 'section', text: { type: 'mrkdwn', text: 'Please reply in Gmail for this one (thread could not be located reliably).' } }
-          ],
-          private_metadata: JSON.stringify(md)
-        }
-      });
-      return;
+// HARD REQUIREMENT: do not proceed unless both are resolved
+if (!resolvedTo || !resolvedSubject) {
+  await ack({
+    response_action: 'update',
+    view: {
+      type: 'modal',
+      callback_id: 'reply_cannot_resolve',
+      title: { type: 'plain_text', text: 'Reply to Customer' },
+      close: { type: 'plain_text', text: 'Close' },
+      blocks: [
+        { type: 'section', text: { type: 'mrkdwn', text: '*Cannot determine customer email and subject automatically.*' } },
+        { type: 'section', text: { type: 'mrkdwn', text: `*Order:* ${orderName}` } },
+        { type: 'section', text: { type: 'mrkdwn', text: `*Detected subject in Slack:* ${subjectGuess || '(none)'}` } },
+        { type: 'section', text: { type: 'mrkdwn', text: 'Please reply in Gmail for this one (thread could not be located reliably).' } }
+      ],
+      private_metadata: JSON.stringify(md)
     }
+  });
+  return;
+}
 
     await ack({
       response_action: 'update',
@@ -1389,7 +1266,7 @@ app.view('choose_reply_or_forward', async ({ ack, body, view, client, logger }) 
         close: { type: 'plain_text', text: 'Cancel' },
         blocks: [
           { type: 'section', text: { type: 'mrkdwn', text: `*To:* ${resolvedTo}` } },
-          { type: 'section', text: { type: 'mrkdwn', text: `*Subject:* ${resolvedSubject}` } },
+{ type: 'section', text: { type: 'mrkdwn', text: `*Subject:* ${resolvedSubject}` } },
           {
             type: 'input',
             block_id: 'body_block',
@@ -1402,13 +1279,14 @@ app.view('choose_reply_or_forward', async ({ ack, body, view, client, logger }) 
             }
           }
         ],
+        // Carry resolved info forward for the review + send steps
         private_metadata: JSON.stringify({ ...md, resolvedTo, resolvedSubject })
       }
     });
     return;
   }
 
-  // Forward flow (unchanged from your 2.js)
+  // Forward flow unchanged
   await ack({
     response_action: 'update',
     view: {
@@ -1447,15 +1325,15 @@ app.view('reply_body_modal', async ({ ack, body, view, client }) => {
   const md = JSON.parse(view.private_metadata || '{}');
   const replyBody = view.state.values?.body_block?.body?.value?.trim();
 
-  if (!md.resolvedTo || !md.resolvedSubject) {
-    await ack({
-      response_action: 'errors',
-      errors: {
-        body_block: 'Internal error: recipient/subject not resolved. Close and try again.'
-      }
-    });
-    return;
-  }
+if (!md.resolvedTo || !md.resolvedSubject) {
+  await ack({
+    response_action: 'errors',
+    errors: {
+      body_block: 'Internal error: recipient/subject not resolved. Close and try again.'
+    }
+  });
+  return;
+}
 
   if (!replyBody) {
     await ack({ response_action: 'errors', errors: { body_block: 'Please enter a message' } });
@@ -1463,7 +1341,7 @@ app.view('reply_body_modal', async ({ ack, body, view, client }) => {
   }
 
   const showTo = md.resolvedTo;
-  const showSubject = md.resolvedSubject;
+const showSubject = md.resolvedSubject;
 
   await ack({
     response_action: 'update',
@@ -1493,17 +1371,17 @@ app.view('reply_review_modal', async ({ ack, body, view, client, logger }) => {
 
   try {
     const found = await gmailFindThread({ subjectGuess, orderName });
-    if (!found) throw new Error('Could not locate Gmail thread. Try replying in Gmail for this one.');
+if (!found) throw new Error('Could not locate Gmail thread. Try replying in Gmail for this one.');
 
-    // 1) Try the anchored-header heuristic
-    const anchored = await gmailPickCustomerFromAnchoredHeader(found.threadId);
+// 1) Try the anchored-header heuristic
+const anchored = await gmailPickCustomerFromAnchoredHeader(found.threadId);
 
-    // 2) Fallback to "latest inbound not from us"
-    const latest = anchored?.rich || await gmailGetLatestInboundInThread(found.threadId);
+// 2) Fallback to "latest inbound not from us"
+const latest = anchored?.rich || await gmailGetLatestInboundInThread(found.threadId);
 
-    // Final reply-to address: prefer resolved, then anchored, then latest
-    const replyTo = resolvedTo || anchored?.email || latest.replyAddress;
-    if (!replyTo) throw new Error('Could not determine customer email address (Reply-To/From missing).');
+// Final reply-to address: prefer resolved, then anchored, then latest
+const replyTo = resolvedTo || anchored?.email || latest.replyAddress;
+if (!replyTo) throw new Error('Could not determine customer email address (Reply-To/From missing).');
 
     const subjectBase = resolvedSubject || latest.subject || (subjectGuess || `Your Carismo Order ${orderName}`);
     const subject = subjectBase.startsWith('Re:') ? subjectBase : `Re: ${subjectBase}`;
@@ -1600,8 +1478,8 @@ const latest = await gmailGetLatestInboundInThread(found.threadId);
    Start
 ========================= */
 (async () => {
-await app.start();
-console.log(`✅ needphotonoship-reply-from-customer is running (Socket Mode)`);
+  await app.start(); // ← no port in Socket Mode
+  console.log('✅ email-actions bot running (Socket Mode)');
   console.log('🔧 Watching channel ID:', WATCH_CHANNEL || '(not set)');
 
   try {
