@@ -466,6 +466,55 @@ function collectEmailHaystacks(event) {
 }
 
 
+// === Slack Email metadata resolver (subject + customer email) ===
+async function resolveEmailMetaFromSlack({ client, channel, root_ts }) {
+  // 1) Pull the root message (where the Email file is attached)
+  const hist = await client.conversations.replies({
+    channel,
+    ts: root_ts,
+    inclusive: true,
+    limit: 1
+  });
+
+  const msgs = hist.messages || [];
+  const root = msgs.find(m => m.ts === root_ts) || msgs[0];
+
+  // 2) Look for Slack Email file on the message
+  const files = Array.isArray(root?.files) ? root.files : [];
+  const emailFile = files.find(f => f.mode === 'email') || null;
+
+  // 3) If not present (edge case), bail early
+  if (!emailFile) {
+    return { subject: '', fromAddress: '' };
+  }
+
+  // 4) Prefer inline fields available on the file (fast path)
+  let subject = emailFile.subject || emailFile.headers?.subject || '';
+  let fromAddress =
+    (emailFile.from && emailFile.from[0]?.address) ||
+    (emailFile.headers?.from && (emailFile.headers.from.match(/<([^>]+)>/)?.[1] || emailFile.headers.from)) ||
+    '';
+
+  // 5) If anything is missing, call files.info as a fallback (rare)
+  if (!subject || !fromAddress) {
+    const info = await client.files.info({ file: emailFile.id });
+    const f = info.file || {};
+    subject = subject || f.subject || f.headers?.subject || '';
+    fromAddress =
+      fromAddress ||
+      (f.from && f.from[0]?.address) ||
+      (f.headers?.from && (f.headers.from.match(/<([^>]+)>/)?.[1] || f.headers.from)) ||
+      '';
+  }
+
+  // Normalize
+  subject = String(subject || '').trim();
+  fromAddress = String(fromAddress || '').trim().toLowerCase();
+
+  return { subject, fromAddress };
+}
+
+
 // --- Ignore the Daily NeedPhotoNoShip reminder in THIS app ---
 const DAILY_NEEDPHOTO_SUBJECT = /^Daily Reminder to Remove NeedPhotoNoShip Tag and Follow-Up Metafields as Needed$/i;
 function isDailyNeedPhotoReminder(event) {
@@ -619,18 +668,11 @@ async function gmailFindThread({ subjectGuess, orderName }) {
   const baseFilters = `to:${our} -from:${our} newer_than:30d`;
   const queries = [];
 
-    const normSubjectEsc = normSubject.replace(/"/g, '\\"');
-
-  // Query 1: subject (exact phrase you saw in Slack)
-  if (normSubjectEsc) {
-    queries.push(`${baseFilters} subject:"${normSubjectEsc}"`);
+  if (normSubject && orderName) {
+    queries.push(`${baseFilters} subject:"${normSubject.replace(/"/g, '\\"')}" "${orderName}"`);
   }
-
-  // Query 2 (fallback): if we somehow didn't get a subject, still require the app's anchor phrase
-  if (!normSubjectEsc) {
-    // This keeps the search safely in NeedPhotoNoShip territory
-    queries.push(`${baseFilters} subject:"we need some info from you"`);
-  }
+  if (orderName) queries.push(`${baseFilters} "${orderName}"`);
+  if (normSubject) queries.push(`${baseFilters} subject:"${normSubject.replace(/"/g, '\\"')}"`);
 
   // Helper to check if a thread has a legit inbound-to-us message
   function threadHasInboundToUs(thread) {
@@ -646,13 +688,13 @@ async function gmailFindThread({ subjectGuess, orderName }) {
       const toIncludesUs = toList.includes(our);
 
       const anchorOk = MUST_CONTAIN_SINGLE_PHRASE.test(subj);
-      if (!fromIsUs && toIncludesUs && anchorOk) return true;   // ideal case (your “[RESPONSE REQUIRED] …”)
+      if (!fromIsUs && toIncludesUs && anchorOk) return true;   // ideal case for this app
+      if (!fromIsUs && toIncludesUs) return true;               // otherwise still customer → us
     }
     return false;
   }
 
   for (const q of queries) {
-    // Search threads, not individual messages
     const tl = await gmail.users.threads.list({ userId: 'me', q, maxResults: 10 });
     const threads = tl.data.threads || [];
     for (const t of threads) {
@@ -662,7 +704,6 @@ async function gmailFindThread({ subjectGuess, orderName }) {
         format: 'full'
       });
       if (threadHasInboundToUs(thr.data)) {
-        // Return thread id; let downstream pick the anchored/latest message
         return { threadId: thr.data.id };
       }
     }
@@ -1236,14 +1277,21 @@ app.action('reply_forward', async ({ ack, body, client }) => {
   await ack();
 
   const channel = body.channel?.id;
-  const thread_ts = body.message?.thread_ts || body.message?.ts;
+  const thread_ts = body.message?.thread_ts || body.message?.ts; // root ts where the Email file is attached
 
-  let orderName = '', subjectGuess = '';
+  let orderName = '';
+  let subjectGuess = '';
   try {
     const payload = JSON.parse(body.actions?.[0]?.value || '{}');
     orderName = payload.orderName || '';
     subjectGuess = payload.subjectGuess || '';
   } catch {}
+
+  // Resolve subject & customer email directly from the Slack Email file
+  const meta = await resolveEmailMetaFromSlack({ client, channel, root_ts: thread_ts });
+  const customerEmailGuess = meta.fromAddress || '';
+  // Prefer Slack’s subject if we didn’t already have one
+  subjectGuess = subjectGuess || meta.subject || '';
 
   await client.views.open({
     trigger_id: body.trigger_id,
@@ -1269,13 +1317,13 @@ app.action('reply_forward', async ({ ack, body, client }) => {
           }
         }
       ],
-      private_metadata: JSON.stringify({ channel, thread_ts, orderName, subjectGuess })
+      private_metadata: JSON.stringify({ channel, thread_ts, orderName, subjectGuess, customerEmail: customerEmailGuess })
     }
   });
 });
 
 /* Choose Reply or Forward -> next modal */
-app.view('choose_reply_or_forward', async ({ ack, body, view, client }) => {
+app.view('choose_reply_or_forward', async ({ ack, body, view, client, logger }) => {
   const md = JSON.parse(view.private_metadata || '{}');
   const choice = view.state.values?.choice_block?.choice?.selected_option?.value;
 
@@ -1284,52 +1332,113 @@ app.view('choose_reply_or_forward', async ({ ack, body, view, client }) => {
     return;
   }
 
+  if (choice === 'reply') {
+    const { orderName, subjectGuess } = md;
+
+    // Start with Slack-derived guesses; we will upgrade from Gmail thread if possible
+    let resolvedTo = md.customerEmail || '';
+    let resolvedSubject = md.subjectGuess || '';
+    let latest = null;
+
+    try {
+      const found = await gmailFindThread({ subjectGuess, orderName });
+      if (found) {
+        const anchored = await gmailPickCustomerFromAnchoredHeader(found.threadId);
+        latest = anchored?.rich || await gmailGetLatestInboundInThread(found.threadId);
+
+        if (!resolvedTo) {
+          resolvedTo = anchored?.email || latest?.replyAddress || '';
+        }
+        if (!resolvedSubject) {
+          const baseSub = (latest?.subject || subjectGuess || `Your Carismo Order ${orderName}`) || '';
+          resolvedSubject = baseSub.startsWith('Re:') ? baseSub : `Re: ${baseSub}`;
+        }
+      }
+    } catch (e) {
+      logger?.error?.('pre-resolve reply info failed', e);
+    }
+
+    // HARD REQUIREMENT: do not proceed unless BOTH are resolved
+    if (!resolvedTo || !resolvedSubject) {
+      await ack({
+        response_action: 'update',
+        view: {
+          type: 'modal',
+          callback_id: 'reply_cannot_resolve',
+          title: { type: 'plain_text', text: 'Reply to Customer' },
+          close: { type: 'plain_text', text: 'Close' },
+          blocks: [
+            { type: 'section', text: { type: 'mrkdwn', text: '*Cannot determine customer email and subject automatically.*' } },
+            { type: 'section', text: { type: 'mrkdwn', text: `*Order:* ${orderName}` } },
+            { type: 'section', text: { type: 'mrkdwn', text: `*Detected subject in Slack:* ${subjectGuess || '(none)'}` } },
+            { type: 'section', text: { type: 'mrkdwn', text: 'Please reply in Gmail for this one (thread could not be located reliably).' } }
+          ],
+          private_metadata: JSON.stringify(md)
+        }
+      });
+      return;
+    }
+
+    await ack({
+      response_action: 'update',
+      view: {
+        type: 'modal',
+        callback_id: 'reply_body_modal',
+        title: { type: 'plain_text', text: 'Reply to Customer' },
+        submit: { type: 'plain_text', text: 'Review' },
+        close: { type: 'plain_text', text: 'Cancel' },
+        blocks: [
+          { type: 'section', text: { type: 'mrkdwn', text: `*To:* ${resolvedTo}` } },
+          { type: 'section', text: { type: 'mrkdwn', text: `*Subject:* ${resolvedSubject}` } },
+          {
+            type: 'input',
+            block_id: 'body_block',
+            label: { type: 'plain_text', text: 'Message to customer' },
+            element: {
+              type: 'plain_text_input',
+              action_id: 'body',
+              multiline: true,
+              placeholder: { type: 'plain_text', text: 'Type your reply…' }
+            }
+          }
+        ],
+        private_metadata: JSON.stringify({ ...md, resolvedTo, resolvedSubject })
+      }
+    });
+    return;
+  }
+
+  // Forward flow (unchanged from your 2.js)
   await ack({
     response_action: 'update',
-    view: choice === 'reply'
-      ? {
-          type: 'modal',
-          callback_id: 'reply_body_modal',
-          title: { type: 'plain_text', text: 'Reply to Customer' },
-          submit: { type: 'plain_text', text: 'Review' },
-          close: { type: 'plain_text', text: 'Cancel' },
-          blocks: [
-            { type: 'input',
-              block_id: 'body_block',
-              label: { type: 'plain_text', text: 'Message to customer' },
-              element: { type: 'plain_text_input', action_id: 'body', multiline: true, placeholder: { type: 'plain_text', text: 'Type your reply…' } }
-            }
-          ],
-          private_metadata: JSON.stringify(md)
+    view: {
+      type: 'modal',
+      callback_id: 'forward_pick_modal',
+      title: { type: 'plain_text', text: 'Forward to Team' },
+      submit: { type: 'plain_text', text: 'Review' },
+      close: { type: 'plain_text', text: 'Cancel' },
+      blocks: [
+        {
+          type: 'input',
+          block_id: 'to_block',
+          label: { type: 'plain_text', text: 'Select recipients' },
+          element: {
+            type: 'multi_static_select',
+            action_id: 'to',
+            options: [
+              'kenny@carismodesign.com',
+              'kevinl@carismodesign.com',
+              'irish@carismodesign.com',
+              'k@carismodesign.com',
+              'shop@carismodesign.com',
+              'nicholas@carismodesign.com',
+            ].map(e => ({ text: { type: 'plain_text', text: e }, value: e })),
+            placeholder: { type: 'plain_text', text: 'Pick one or more' }
+          }
         }
-      : {
-          type: 'modal',
-          callback_id: 'forward_pick_modal',
-          title: { type: 'plain_text', text: 'Forward to Team' },
-          submit: { type: 'plain_text', text: 'Review' },
-          close: { type: 'plain_text', text: 'Cancel' },
-          blocks: [
-            {
-              type: 'input',
-              block_id: 'to_block',
-              label: { type: 'plain_text', text: 'Select recipients' },
-              element: {
-                type: 'multi_static_select',
-                action_id: 'to',
-                options: [
-                  'kenny@carismodesign.com',
-                  'kevinl@carismodesign.com',
-                  'irish@carismodesign.com',
-                  'k@carismodesign.com',
-                  'shop@carismodesign.com',
-                  'nicholas@carismodesign.com',
-                ].map(e => ({ text: { type: 'plain_text', text: e }, value: e })),
-                placeholder: { type: 'plain_text', text: 'Pick one or more' }
-              }
-            }
-          ],
-          private_metadata: JSON.stringify(md)
-        }
+      ],
+      private_metadata: JSON.stringify(md)
+    }
   });
 });
 
@@ -1338,10 +1447,23 @@ app.view('reply_body_modal', async ({ ack, body, view, client }) => {
   const md = JSON.parse(view.private_metadata || '{}');
   const replyBody = view.state.values?.body_block?.body?.value?.trim();
 
+  if (!md.resolvedTo || !md.resolvedSubject) {
+    await ack({
+      response_action: 'errors',
+      errors: {
+        body_block: 'Internal error: recipient/subject not resolved. Close and try again.'
+      }
+    });
+    return;
+  }
+
   if (!replyBody) {
     await ack({ response_action: 'errors', errors: { body_block: 'Please enter a message' } });
     return;
   }
+
+  const showTo = md.resolvedTo;
+  const showSubject = md.resolvedSubject;
 
   await ack({
     response_action: 'update',
@@ -1352,6 +1474,8 @@ app.view('reply_body_modal', async ({ ack, body, view, client }) => {
       submit: { type: 'plain_text', text: 'Send' },
       close: { type: 'plain_text', text: 'Back' },
       blocks: [
+        { type: 'section', text: { type: 'mrkdwn', text: `*To:* ${showTo}` } },
+        { type: 'section', text: { type: 'mrkdwn', text: `*Subject:* ${showSubject}` } },
         { type: 'section', text: { type: 'mrkdwn', text: '*Your message:*' } },
         { type: 'section', text: { type: 'mrkdwn', text: '```' + replyBody + '```' } }
       ],
@@ -1365,23 +1489,23 @@ app.view('reply_review_modal', async ({ ack, body, view, client, logger }) => {
   await ack();
 
   const md = JSON.parse(view.private_metadata || '{}');
-  const { channel, thread_ts, orderName, subjectGuess, replyBody } = md;
+  const { channel, thread_ts, orderName, subjectGuess, replyBody, resolvedTo, resolvedSubject } = md;
 
   try {
     const found = await gmailFindThread({ subjectGuess, orderName });
-if (!found) throw new Error('Could not locate Gmail thread. Try replying in Gmail for this one.');
+    if (!found) throw new Error('Could not locate Gmail thread. Try replying in Gmail for this one.');
 
-// 1) Try the anchored-header heuristic
-const anchored = await gmailPickCustomerFromAnchoredHeader(found.threadId);
+    // 1) Try the anchored-header heuristic
+    const anchored = await gmailPickCustomerFromAnchoredHeader(found.threadId);
 
-// 2) Fallback to "latest inbound not from us"
-const latest = anchored?.rich || await gmailGetLatestInboundInThread(found.threadId);
+    // 2) Fallback to "latest inbound not from us"
+    const latest = anchored?.rich || await gmailGetLatestInboundInThread(found.threadId);
 
-// Final reply-to address (anchored wins)
-const replyTo = anchored?.email || latest.replyAddress;
-if (!replyTo) throw new Error('Could not determine customer email address (Reply-To/From missing)');
+    // Final reply-to address: prefer resolved, then anchored, then latest
+    const replyTo = resolvedTo || anchored?.email || latest.replyAddress;
+    if (!replyTo) throw new Error('Could not determine customer email address (Reply-To/From missing).');
 
-    const subjectBase = latest.subject || (subjectGuess || `Your Carismo Order ${orderName}`);
+    const subjectBase = resolvedSubject || latest.subject || (subjectGuess || `Your Carismo Order ${orderName}`);
     const subject = subjectBase.startsWith('Re:') ? subjectBase : `Re: ${subjectBase}`;
 
     // Build plain + HTML with quoted original HTML to preserve formatting
