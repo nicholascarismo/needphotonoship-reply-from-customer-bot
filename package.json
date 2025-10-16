@@ -1,5 +1,5 @@
 {
-  "name": "needphotonoship-reply-from-customer",
+  "name": "needphotonoship-reply-from-customer-bot",
   "version": "1.0.0",
   "type": "module",
   "engines": { "node": ">=18" },
