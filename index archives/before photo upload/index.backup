@@ -100,17 +100,6 @@ const ORDER_LOOKUP_GQL = `
           tags
           needsFollowUpMf: metafield(namespace: "custom", key: "_nc_needs_follow_up_") { id value }
           followUpNotesMf: metafield(namespace: "custom", key: "follow_up_notes") { id value }
-          referenceImagesMf: metafield(namespace: "custom", key: "reference_images") {
-            id
-            type
-            references(first: 100) {
-              nodes {
-                __typename
-                ... on MediaImage { id }
-                ... on GenericFile { id }
-              }
-            }
-          }
         }
       }
     }
@@ -158,28 +147,6 @@ const ORDER_UPDATE_GQL = `
   mutation orderUpdate($input: OrderInput!) {
     orderUpdate(input: $input) {
       order { id note }
-      userErrors { field message }
-    }
-  }
-`;
-
-const STAGED_UPLOADS_CREATE_GQL = `
-  mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
-    stagedUploadsCreate(input: $input) {
-      stagedTargets {
-        url
-        resourceUrl
-        parameters { name value }
-      }
-      userErrors { field message }
-    }
-  }
-`;
-
-const FILES_CREATE_GQL = `
-  mutation fileCreate($files: [FileCreateInput!]!) {
-    fileCreate(files: $files) {
-      files { __typename ... on MediaImage { id } ... on GenericFile { id } }
       userErrors { field message }
     }
   }
@@ -271,99 +238,6 @@ async function prependOrderNote(orderId, newLine) {
   const errs = res?.orderUpdate?.userErrors || [];
   if (errs.length) throw new Error(`orderUpdate errors: ${JSON.stringify(errs)}`);
   return res?.orderUpdate?.order?.note || '';
-}
-
-function sleep(ms) { return new Promise(res => setTimeout(res, ms)); }
-
-// ---------- Shopify file upload pipeline (Gmail attachments -> Shopify Files) ----------
-
-async function shopifyStagedUploadsCreate(filesMeta /* [{filename, mime}] */) {
-  const input = filesMeta.map(f => ({
-    resource: "FILE",
-    filename: f.filename,
-    mimeType: f.mime || "application/octet-stream",
-    httpMethod: "POST"
-  }));
-  const res = await shopifyGQL(STAGED_UPLOADS_CREATE_GQL, { input });
-  const errs = res?.stagedUploadsCreate?.userErrors || [];
-  if (errs.length) throw new Error(`stagedUploadsCreate: ${JSON.stringify(errs)}`);
-  return res.stagedUploadsCreate.stagedTargets || [];
-}
-
-async function uploadToStagedTarget(target, file /* {filename, mime, b64} */) {
-  const form = new FormData();
-  for (const p of target.parameters || []) form.append(p.name, p.value);
-  const buffer = Buffer.from(file.b64, 'base64');
-  form.append('file', new Blob([buffer], { type: file.mime }), file.filename);
-
-  const resp = await fetch(target.url, { method: 'POST', body: form });
-  if (!resp.ok) {
-    const txt = await resp.text().catch(() => '');
-    throw new Error(`staged upload failed ${resp.status}: ${txt.slice(0, 400)}`);
-  }
-}
-
-async function shopifyFilesCreateFromStaged(stagedTargets) {
-  const filesInput = stagedTargets.map(t => ({ originalSource: t.resourceUrl }));
-  const res = await shopifyGQL(FILES_CREATE_GQL, { files: filesInput });
-  const errs = res?.fileCreate?.userErrors || [];
-  if (errs.length) throw new Error(`fileCreate: ${JSON.stringify(errs)}`);
-  const created = res?.fileCreate?.files || [];
-  return created.map(f => f.id).filter(Boolean);
-}
-
-/** Merge and write NEW + EXISTING to the list.file_reference metafield */
-async function addFilesToOrderReferenceImages(order, newFileIds) {
-  if (!newFileIds?.length) return;
-
-  const existing = order?.referenceImagesMf?.references?.nodes || [];
-  const existingIds = existing.map(n => n.id).filter(Boolean);
-  const merged = Array.from(new Set([...existingIds, ...newFileIds])); // de-dupe
-
-  const mfInput = {
-    ownerId: order.id,
-    namespace: 'custom',
-    key: 'reference_images',
-    type: 'list.file_reference',
-    // IMPORTANT: For list.* reference-types we set the *value* to a JSON string of IDs
-    value: JSON.stringify(merged)
-  };
-
-  // Retry a bit to ride out any Files propagation delay
-  const MAX_TRIES = 5;
-  const DELAY_MS  = 1500;
-  let lastErr = null;
-
-  for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
-    try {
-      const setRes = await shopifyGQL(METAFIELDS_SET_GQL, { metafields: [mfInput] });
-      const errs = setRes?.metafieldsSet?.userErrors || [];
-      if (!errs.length) return; // success
-      lastErr = new Error(`metafieldsSet errors (attempt ${attempt}): ${JSON.stringify(errs)}`);
-    } catch (e) {
-      lastErr = e;
-    }
-    await sleep(DELAY_MS);
-  }
-  throw lastErr || new Error('metafieldsSet(list.file_reference) failed after retries');
-}
-
-/** End-to-end: pull image attachments from the latest inbound Gmail message and attach */
-async function uploadEmailImagesToOrderMetafield({ latestMessage, order }) {
-  const all = await collectAttachmentsFromMessage(latestMessage._raw);
-  const images = all.filter(f => /^image\//i.test(f.mime));
-  if (!images.length) return { uploadedCount: 0, fileIds: [] };
-
-  const stagedTargets = await shopifyStagedUploadsCreate(images.map(({ filename, mime }) => ({ filename, mime })));
-  for (let i = 0; i < images.length; i++) {
-    await uploadToStagedTarget(stagedTargets[i], images[i]);
-  }
-
-  const fileIds = await shopifyFilesCreateFromStaged(stagedTargets);
-  await sleep(1500); // small settle time
-  await addFilesToOrderReferenceImages(order, fileIds);
-
-  return { uploadedCount: fileIds.length, fileIds };
 }
 
 /* =========================
@@ -1201,29 +1075,6 @@ app.action('good_clear', async ({ ack, body, client, logger }) => {
     const by = `@${body.user?.username || body.user?.name || 'user'}`;
     const newLine = `Info verified via customer email response on ${date} by ${by}`;
     await prependOrderNote(orderId, newLine);
-
-// --- Attach any images from the customer email thread to custom.reference_images ---
-try {
-  let subjectGuess = '';
-  try {
-    const payload = JSON.parse(body.actions?.[0]?.value || '{}');
-    subjectGuess = payload.subjectGuess || '';
-  } catch {}
-
-  const foundThread = await gmailFindThread({ subjectGuess, orderName });
-  if (foundThread) {
-    const latestInbound = await gmailGetLatestInboundInThread(foundThread.threadId);
-    const result = await uploadEmailImagesToOrderMetafield({ latestMessage: latestInbound, order });
-
-    if (result.uploadedCount > 0) {
-      await prependOrderNote(orderId, `Attached ${result.uploadedCount} reference image(s) from customer email to metafield custom.reference_images.`);
-    }
-  }
-} catch (attachErr) {
-  logger?.error?.('reference_images attach failed (App 2)', attachErr);
-  await client.chat.postMessage({ channel, thread_ts, text: `⚠️ Could not attach reference images this time: ${attachErr.message}` });
-  // non-fatal
-}
 
     const adminUrl = orderAdminUrl(legacyId);
 
