@@ -825,16 +825,19 @@ function extractCustomerTopText(raw) {
   let t = String(raw || '');
   if (!t) return '';
 
-  // Normalize newlines
-  t = t.replace(/\r\n/g, '\n').trim();
+  // Normalize newlines and non-breaking spaces
+  t = t.replace(/\r\n/g, '\n').replace(/\u00A0/g, ' ').trim();
 
   // Identify the earliest "cut" marker that indicates the start of the quoted thread or signature
   const markers = [
-    /^\s*On .+ wrote:\s*$/mi,     // "On Oct 20, 2025, at 6:16 PM, Name <email> wrote:"
-    /^\s*From:\s.*$/mi,           // "From: Name <email>"
+    /^\s*On .+wrote:\s*$/mi,                   // "On Mon, Oct 20, 2025, ... wrote:"
+    /^\s*On .+ at .+ wrote:\s*$/mi,            // "On Oct 20, 2025 at 6:16 PM ... wrote:"
+    /^\s*From:\s.*$/mi,                        // "From: Name <email>"
+    /^\s*Begin forwarded message:\s*$/mi,
+    /^\s*-+\s*Original Message\s*-+\s*$/mi,
     /^\s*Sent from my iPhone\s*$/mi,
     /^\s*Sent from my iPad\s*$/mi,
-    /^\s*--\s*$/m                 // signature delimiter "-- "
+    /^\s*--\s*$/m                               // signature delimiter "-- "
   ];
 
   let cutIndex = -1;
@@ -844,23 +847,21 @@ function extractCustomerTopText(raw) {
       cutIndex = m.index;
     }
   }
-  if (cutIndex > -1) {
-    t = t.slice(0, cutIndex);
-  }
+  if (cutIndex > -1) t = t.slice(0, cutIndex);
 
-  // Drop quoted lines (beginning with '>') and obvious signature/image placeholders
+  // Drop quoted lines and obvious placeholders
   t = t
     .split('\n')
-    .filter(line => !/^\s*>/.test(line))
+    .filter(line => !/^\s*>/.test(line))                 // remove quoted
     .filter(line => !/^\s*(image|signature)[:\s]/i.test(line))
     .join('\n');
 
   // Collapse excessive blank lines
   t = t.replace(/\n{3,}/g, '\n\n').trim();
 
-  // Ignore extremely short fragments (likely noise)
+  // Allow short answers like "Yes", "No", "Attached"
   const minContent = t.replace(/\s+/g, '');
-  if (minContent.length < 5) return '';
+  if (minContent.length < 2) return '';
 
   // Cap to keep Shopify Notes readable
   if (t.length > 2000) t = t.slice(0, 2000) + '…';
@@ -1282,19 +1283,43 @@ try {
       // non-fatal; continue to text extraction
     }
 
-    // 2) Extract customer's free-text (above quoted thread/signature) and prepend to Notes
-    try {
-      const freeText = extractCustomerTopText(latestInbound.bodyText || '');
-      if (freeText) {
-        await prependOrderNote(
-          orderId,
-          `Customer message from email:\n${freeText}`
-        );
-      }
-    } catch (textErr) {
-      logger?.error?.('customer free-text extraction failed (App 2)', textErr);
-      // silent fail is fine
+// 2) Extract customer's free-text (above quoted thread/signature) and prepend to Notes
+try {
+  // Fallback: if bodyText is empty/thin, strip HTML to text
+  let rawText = latestInbound.bodyText || '';
+  if (!rawText || rawText.replace(/\s+/g, '').length < 2) {
+    if (latestInbound.bodyHtml) {
+      rawText = latestInbound.bodyHtml
+        .replace(/<\/p>/gi, '\n\n')
+        .replace(/<br\s*\/?>/gi, '\n')
+        .replace(/<[^>]+>/g, '')
+        .replace(/\u00A0/g, ' ')
+        .trim();
     }
+  }
+
+  const freeText = extractCustomerTopText(rawText);
+
+  if (freeText) {
+    await prependOrderNote(
+      orderId,
+      `Customer message from email:\n${freeText}`
+    );
+    logger?.info?.({
+      customerFreeTextExtracted: true,
+      preview: freeText.slice(0, 120)
+    });
+  } else {
+    logger?.info?.({
+      customerFreeTextExtracted: false,
+      note: 'No usable free text found after extraction.',
+      rawPreview: (rawText || '').slice(0, 120)
+    });
+  }
+} catch (textErr) {
+  logger?.error?.('customer free-text extraction failed (App 2)', textErr);
+  // silent fail is fine
+}
   }
 } catch (outerErr) {
   logger?.error?.('email processing (images + text) failed (App 2)', outerErr);
