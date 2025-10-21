@@ -825,26 +825,19 @@ function extractCustomerTopText(raw) {
   let t = String(raw || '');
   if (!t) return '';
 
-  // Normalize newlines and Unicode dashes / nbsp
-  t = t.replace(/\r\n/g, '\n');
-  t = t.replace(/\u00A0/g, ' '); // nbsp -> space
-  t = t.replace(/[\u2010\u2011\u2012\u2013\u2014\u2015\u2212]/g, '-').trim();
+  // Normalize newlines and non-breaking spaces
+  t = t.replace(/\r\n/g, '\n').replace(/\u00A0/g, ' ').trim();
 
-  // If the "Original message" or "Forwarded message" divider is glued to the next header,
-  // insert a newline so our markers can catch it.
-  t = t.replace(/(-{2,}\s*Original message\s*-{2,})(?=From:)/gi, '$1\n');
-  t = t.replace(/(-{2,}\s*Forwarded message\s*-{2,})(?=From:)/gi, '$1\n');
-
-  // Find the earliest "cut" marker (start of quoted thread / headers / signature)
-  // NOTE: no "$" at end; we want to match even if more text follows on the same line.
+  // Identify the earliest "cut" marker that indicates the start of the quoted thread or signature
   const markers = [
-    /^\s*On .+ wrote:/mi,                         // "On Oct 20, 2025, … wrote:"
-    /^\s*-{2,}\s*Original message\s*-{2,}/mi,     // "-------- Original message --------"
-    /^\s*-{2,}\s*Forwarded message\s*-{2,}/mi,    // "---------- Forwarded message ----------"
-    /^\s*From:\s.*$/mi,                           // "From: …"
-    /^\s*Subject:\s.*$/mi,                        // "Subject: …"
-    /^\s*To:\s.*$/mi,                             // "To: …"
-    /^\s*Date:\s.*$/mi                            // "Date: …"
+    /^\s*On .+wrote:\s*$/mi,                   // "On Mon, Oct 20, 2025, ... wrote:"
+    /^\s*On .+ at .+ wrote:\s*$/mi,            // "On Oct 20, 2025 at 6:16 PM ... wrote:"
+    /^\s*From:\s.*$/mi,                        // "From: Name <email>"
+    /^\s*Begin forwarded message:\s*$/mi,
+    /^\s*-+\s*Original Message\s*-+\s*$/mi,
+    /^\s*Sent from my iPhone\s*$/mi,
+    /^\s*Sent from my iPad\s*$/mi,
+    /^\s*--\s*$/m                               // signature delimiter "-- "
   ];
 
   let cutIndex = -1;
@@ -854,26 +847,21 @@ function extractCustomerTopText(raw) {
       cutIndex = m.index;
     }
   }
-  if (cutIndex > -1) {
-    t = t.slice(0, cutIndex);
-  }
+  if (cutIndex > -1) t = t.slice(0, cutIndex);
 
-  // Drop quoted lines (begin with '>') and common signature/mobile footers
-  const sigLine = /^(sent from my|sent via|get outlook for|mail\.ru|yahoo mail for|gmail mobile)/i;
-
+  // Drop quoted lines and obvious placeholders
   t = t
     .split('\n')
-    .filter(line => !/^\s*>/.test(line))                        // quoted thread
-    .filter(line => !/^\s*(image|signature)[:\s]/i.test(line))  // placeholders
-    .filter(line => !sigLine.test(line.trim()))                 // mobile signatures
+    .filter(line => !/^\s*>/.test(line))                 // remove quoted
+    .filter(line => !/^\s*(image|signature)[:\s]/i.test(line))
     .join('\n');
 
   // Collapse excessive blank lines
   t = t.replace(/\n{3,}/g, '\n\n').trim();
 
-  // Ignore extremely short fragments (likely noise)
+  // Allow short answers like "Yes", "No", "Attached"
   const minContent = t.replace(/\s+/g, '');
-  if (minContent.length < 5) return '';
+  if (minContent.length < 2) return '';
 
   // Cap to keep Shopify Notes readable
   if (t.length > 2000) t = t.slice(0, 2000) + '…';
