@@ -656,7 +656,7 @@ function pickNonOurAddress(addresses) {
 }
 
 /** Find the correct CUSTOMER thread (avoid picking our "Fwd" thread) */
-async function gmailFindThread({ subjectGuess, orderName, customerEmail }) {
+async function gmailFindThread({ subjectGuess, orderName }) {
   const gmail = await getGmail();
   const our = SHOP_FROM_EMAIL.toLowerCase();
 
@@ -665,61 +665,38 @@ async function gmailFindThread({ subjectGuess, orderName, customerEmail }) {
     .replace(/^\s*(re:|fwd?:)\s*/i, '')
     .trim();
 
+  // Build customer-centric queries
   const baseFilters = `to:${our} -from:${our} newer_than:30d`;
-  const fromFilter  = customerEmail ? ` from:${customerEmail}` : '';
-
-  // Build STRICT queries (drop the loose orderName-only query)
   const queries = [];
+
   if (normSubject && orderName) {
-    queries.push(`${baseFilters}${fromFilter} subject:"${normSubject.replace(/"/g, '\\"')}" "${orderName}"`);
+    queries.push(`${baseFilters} subject:"${normSubject.replace(/"/g, '\\"')}" "${orderName}"`);
   }
-  if (normSubject) {
-    queries.push(`${baseFilters}${fromFilter} subject:"${normSubject.replace(/"/g, '\\"')}"`);
-  }
-  // Final fallback: anchor phrase + orderName (still constrained)
-  if (orderName) {
-    queries.push(`${baseFilters}${fromFilter} subject:"we need some info from you" "${orderName}"`);
-  }
+  if (orderName) queries.push(`${baseFilters} "${orderName}"`);
+  if (normSubject) queries.push(`${baseFilters} subject:"${normSubject.replace(/"/g, '\\"')}"`);
 
-  // helper to normalize for comparison
-  const wantSubj = normSubject.toLowerCase();
-
-  function subjectMatches(subjRaw) {
-    const s = String(subjRaw || '')
-      .replace(/^\s*(re:|fwd?:)\s*/i, '')
-      .trim()
-      .toLowerCase();
-    if (wantSubj) return s.includes(wantSubj);
-    // If we weren't given a subject, require the known anchor phrase
-    return MUST_CONTAIN_SINGLE_PHRASE.test(subjRaw || '');
-  }
-
+  // Helper to check if a thread has a legit inbound-to-us message
   function threadHasInboundToUs(thread) {
     const msgs = thread.messages || [];
     for (let i = msgs.length - 1; i >= 0; i--) {
       const m = msgs[i];
       const headers = Object.fromEntries((m.payload?.headers || []).map(h => [h.name.toLowerCase(), h.value]));
-      const fromHeader = headers['from'] || '';
+      const from = (headers['from'] || '').toLowerCase();
+      const toList = parseAddressList(headers['to'] || '');
       const subj = headers['subject'] || '';
 
-      const toList = parseAddressList(headers['to'] || '');
-      const fromList = parseAddressList(fromHeader);
-
-      const fromIsUs = fromList.includes(our);
+      const fromIsUs = from.includes(`<${our}>`) || from.includes(our) || from.startsWith(our);
       const toIncludesUs = toList.includes(our);
 
-      // Sender check (if provided)
-      const fromIsCustomer = customerEmail ? fromList.includes(customerEmail.toLowerCase()) : true;
-
-      // STRICT: must be inbound-to-us, subject must match (Slack subject or anchor), and (if provided) from the customer
-      if (!fromIsUs && toIncludesUs && subjectMatches(subj) && fromIsCustomer) {
-        return true;
-      }
+      const anchorOk = MUST_CONTAIN_SINGLE_PHRASE.test(subj);
+      if (!fromIsUs && toIncludesUs && anchorOk) return true;   // ideal case (your “[RESPONSE REQUIRED] …”)
+      if (!fromIsUs && toIncludesUs) return true;               // otherwise still customer → us
     }
     return false;
   }
 
   for (const q of queries) {
+    // Search threads, not individual messages
     const tl = await gmail.users.threads.list({ userId: 'me', q, maxResults: 10 });
     const threads = tl.data.threads || [];
     for (const t of threads) {
@@ -729,6 +706,7 @@ async function gmailFindThread({ subjectGuess, orderName, customerEmail }) {
         format: 'full'
       });
       if (threadHasInboundToUs(thr.data)) {
+        // Return thread id; let downstream pick the anchored/latest message
         return { threadId: thr.data.id };
       }
     }
@@ -1130,27 +1108,27 @@ async function gmailForwardInline({ subject, toList, latest }) {
 /* =========================
    UI: action card (UPDATED)
 ========================= */
-function actionBlocks({ orderName, preview, subjectGuess, customerEmail }) {
+function actionBlocks({ orderName, preview, subjectGuess }) {
   return [
     { type: 'section', text: { type: 'mrkdwn', text: `New reply detected for *${orderName}*.\nChoose an action:` } },
     preview ? { type: 'context', elements: [{ type: 'mrkdwn', text: `_${preview}_` }] } : null,
     {
       type: 'actions',
       elements: [
-        { type: 'button', text: { type: 'plain_text', text: 'Good, clear tags' }, action_id: 'good_clear', style: 'primary', value: JSON.stringify({ orderName, subjectGuess, customerEmail }) },
-        { type: 'button', text: { type: 'plain_text', text: 'Reply/Forward' }, action_id: 'reply_forward', value: JSON.stringify({ orderName, subjectGuess, customerEmail }) },
-        { type: 'button', text: { type: 'plain_text', text: 'Make Trello Card' }, action_id: 'make_trello', value: JSON.stringify({ orderName, subjectGuess, customerEmail }) }
+        { type: 'button', text: { type: 'plain_text', text: 'Good, clear tags' }, action_id: 'good_clear', style: 'primary', value: JSON.stringify({ orderName, subjectGuess }) },
+        { type: 'button', text: { type: 'plain_text', text: 'Reply/Forward' }, action_id: 'reply_forward', value: JSON.stringify({ orderName, subjectGuess }) },
+        { type: 'button', text: { type: 'plain_text', text: 'Make Trello Card' }, action_id: 'make_trello', value: JSON.stringify({ orderName, subjectGuess }) }
       ]
     }
   ].filter(Boolean);
 }
 
-async function postActionCard({ client, channel, thread_ts, orderName, preview, subjectGuess, customerEmail }) {
+async function postActionCard({ client, channel, thread_ts, orderName, preview, subjectGuess }) {
   await client.chat.postMessage({
     channel,
     thread_ts,
     text: `Actions for ${orderName}`,
-    blocks: actionBlocks({ orderName, preview, subjectGuess, customerEmail })
+    blocks: actionBlocks({ orderName, preview, subjectGuess })
   });
 }
 
@@ -1222,15 +1200,14 @@ app.event('message', async ({ event, client, logger }) => {
     }
 
     // 3) Post the same action card as App 1 (buttons behave identically)
-await postActionCard({
-  client,
-  channel: event.channel,
-  thread_ts: event.thread_ts || event.ts,
-  orderName: order.name.toUpperCase(),
-  preview,
-  subjectGuess: subjectGuess || subject || '',   // prefer Slack subject; fall back to file subject
-  customerEmail                                         // <-- add this
-});
+    await postActionCard({
+      client,
+      channel: event.channel,
+      thread_ts: event.thread_ts || event.ts,
+      orderName: order.name.toUpperCase(),
+      preview,
+      subjectGuess: subjectGuess || subject || ''   // prefer Slack subject; fall back to file subject
+    });
 
   } catch (e) {
     logger.error('message handler error (App 2)', e);
@@ -1290,15 +1267,13 @@ app.action('good_clear', async ({ ack, body, client, logger }) => {
 
 // --- Attach images from the customer email thread AND capture the customer's free-text message ---
 try {
-let subjectGuess = '';
-let customerEmail = '';
-try {
-  const payload = JSON.parse(body.actions?.[0]?.value || '{}');
-  subjectGuess = payload.subjectGuess || '';
-  customerEmail = (payload.customerEmail || '').toLowerCase();
-} catch {}
+  let subjectGuess = '';
+  try {
+    const payload = JSON.parse(body.actions?.[0]?.value || '{}');
+    subjectGuess = payload.subjectGuess || '';
+  } catch {}
 
-const foundThread = await gmailFindThread({ subjectGuess, orderName, customerEmail });
+  const foundThread = await gmailFindThread({ subjectGuess, orderName });
   if (foundThread) {
     const latestInbound = await gmailGetLatestInboundInThread(foundThread.threadId);
 
@@ -1509,7 +1484,7 @@ app.view('choose_reply_or_forward', async ({ ack, body, view, client, logger }) 
     let latest = null;
 
     try {
-      const found = await gmailFindThread({ subjectGuess, orderName, customerEmail: (md.customerEmail || '').toLowerCase() });
+      const found = await gmailFindThread({ subjectGuess, orderName });
       if (found) {
         const anchored = await gmailPickCustomerFromAnchoredHeader(found.threadId);
         latest = anchored?.rich || await gmailGetLatestInboundInThread(found.threadId);
@@ -1661,7 +1636,7 @@ app.view('reply_review_modal', async ({ ack, body, view, client, logger }) => {
   const { channel, thread_ts, orderName, subjectGuess, replyBody, resolvedTo, resolvedSubject } = md;
 
   try {
-    const found = await gmailFindThread({ subjectGuess, orderName, customerEmail: (md.customerEmail || '').toLowerCase() });
+    const found = await gmailFindThread({ subjectGuess, orderName });
 if (!found) throw new Error('Could not locate Gmail thread. Try replying in Gmail for this one.');
 
 // 1) Try the anchored-header heuristic
@@ -1744,7 +1719,7 @@ app.view('forward_review_modal', async ({ ack, body, view, client, logger }) => 
   const { channel, thread_ts, orderName, subjectGuess, tos } = md;
 
   try {
-    const found = await gmailFindThread({ subjectGuess, orderName, customerEmail: (md.customerEmail || '').toLowerCase() });
+    const found = await gmailFindThread({ subjectGuess, orderName });
 if (!found) throw new Error('Could not locate Gmail thread for forward.');
 
 const latest = await gmailGetLatestInboundInThread(found.threadId);
