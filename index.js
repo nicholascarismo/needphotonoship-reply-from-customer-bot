@@ -1282,7 +1282,7 @@ app.action('good_clear', async ({ ack, body, client, logger }) => {
     // PREPEND to Notes
     const date = new Date().toISOString().slice(0, 10);
     const by = `@${body.user?.username || body.user?.name || 'user'}`;
-    const newLine = `Info verified via customer email response on ${date} by ${by}`;
+    const newLine = `Info verified via customer email response on ${date}`;
     await prependOrderNote(orderId, newLine);
 
 // --- Attach images from the customer email thread AND capture the customer's free-text message ---
@@ -1305,7 +1305,7 @@ const foundThread = await gmailFindThread({ subjectGuess, orderName, customerEma
       if (result.uploadedCount > 0) {
         await prependOrderNote(
           orderId,
-          `Attached ${result.uploadedCount} reference image(s) from customer email to metafield custom.reference_images.`
+          `Attached ${result.uploadedCount} reference image(s) from customer email to Reference Pic(s) metafield`
         );
       }
     } catch (attachErr) {
