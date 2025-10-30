@@ -1364,18 +1364,6 @@ try {
   // continue; not fatal
 }
 
-    // --- NEW: Create Trello card "[Order#] Cleared - Remember to Process" (no description) ---
-    try {
-      const { listId } = await resolveTrelloIds();
-      const title = `${orderName} Cleared - Remember to Process`; // e.g., "C#1234 Cleared - Remember to Process"
-      await trelloPOST('/cards', { idList: listId, name: title });
-      // Optional confirmation (safe to remove if you prefer absolute silence):
-      await client.chat.postMessage({ channel, thread_ts, text: `📝 Trello card created: "${title}"` });
-    } catch (trelloErr) {
-      logger?.error?.('trello card create failed (good_clear)', trelloErr);
-      await client.chat.postMessage({ channel, thread_ts, text: `⚠️ Trello card create failed: ${trelloErr.message}` });
-    }
-
     const adminUrl = orderAdminUrl(legacyId);
 
     const oldNotesShown =
